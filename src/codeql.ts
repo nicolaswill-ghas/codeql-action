@@ -176,6 +176,16 @@ export interface CodeQL {
     features: FeatureEnablement,
   ): Promise<string>;
   /**
+   * Run 'codeql database interpret-results' with specific output format.
+   */
+  databaseInterpretResultsCustom(
+    databasePath: string,
+    queryPath: string,
+    outputFile: string,
+    outputFormat: string,
+    verbosityFlag: string | undefined,
+  ): Promise<void>;
+  /**
    * Run 'codeql database print-baseline'.
    */
   databasePrintBaseline(databasePath: string): Promise<string>;
@@ -474,6 +484,10 @@ export function setCodeQL(partialCodeql: Partial<CodeQL>): CodeQL {
       partialCodeql,
       "databaseInterpretResults",
     ),
+    databaseInterpretResultsCustom: resolveFunction(
+      partialCodeql,
+      "databaseInterpretResultsCustom",
+    ),
     databasePrintBaseline: resolveFunction(
       partialCodeql,
       "databasePrintBaseline",
@@ -488,7 +502,6 @@ export function setCodeQL(partialCodeql: Partial<CodeQL>): CodeQL {
   };
   return cachedCodeQL;
 }
-
 /**
  * Get the cached CodeQL object. Should only be used from tests.
  *
@@ -573,6 +586,23 @@ export async function getCodeQLForCmd(
       const codeScanningConfigFile = await generateCodeScanningConfig(
         config,
         logger,
+      );
+      // log the location
+      logger.info(
+        `Code-scanning config generated at: ${codeScanningConfigFile}`,
+      );
+
+      // read & log the contents
+      const fileContents = await fs.promises.readFile(
+        codeScanningConfigFile,
+        "utf8",
+      );
+      logger.info(
+        "Config file contents:\n" +
+          fileContents
+            .split("\n")
+            .map((line) => `│ ${line}`)
+            .join("\n"),
       );
       const externalRepositoryToken = getOptionalInput(
         "external-repository-token",
@@ -898,7 +928,26 @@ export async function getCodeQLForCmd(
       ];
       return await runCli(cmd, codeqlArgs);
     },
+    async databaseInterpretResultsCustom(
+      databasePath: string,
+      queryPath: string,
+      outputFile: string,
+      outputFormat: string,
+      verbosityFlag: string = "-v",
+    ): Promise<void> {
+      const codeqlArgs = [
+        "database",
+        "interpret-results",
+        `--format=${outputFormat}`,
+        `--output=${outputFile}`,
+        verbosityFlag,
+        ...getExtraOptionsFromEnv(["database", "interpret-results"]),
+        databasePath,
+        queryPath,
+      ];
 
+      await runCli(cmd, codeqlArgs);
+    },
     /**
      * Download specified packs into the package cache. If the specified
      * package and version already exists (e.g., from a previous analysis run),

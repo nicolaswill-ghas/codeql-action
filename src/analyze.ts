@@ -5,6 +5,7 @@ import { performance } from "perf_hooks";
 import * as io from "@actions/io";
 import del from "del";
 import * as yaml from "js-yaml";
+import { Parser, processors } from "xml2js";
 
 import * as actionsUtil from "./actions-util";
 import { getApiClient } from "./api-client";
@@ -565,6 +566,284 @@ extensions:
   return diffRangeDir;
 }
 
+/**
+ * Find the version directory of a language's QLPack within a CodeQL bundle directory
+ * @param codeqlPath Path to the CodeQL bundle directory
+ * @param language The language name (e.g., "java", "javascript")
+ * @param logger Optional logger for verbose output
+ * @returns The path to the QLPack directory with resolved version
+ * @throws Error if the version directory cannot be found
+ */
+function findQLPackPath(
+  codeqlPath: string,
+  language: string,
+  logger?: Logger,
+): string {
+  if (!fs.existsSync(codeqlPath)) {
+    throw new Error(`Path does not exist: ${codeqlPath}`);
+  }
+
+  if (!fs.statSync(codeqlPath).isDirectory()) {
+    throw new Error(`CodeQL path is not a directory: ${codeqlPath}`);
+  }
+
+  const baseMsg = logger
+    ? (msg: string) => logger.info(msg)
+    : (msg: string) => console.log(msg);
+
+  // Check for qlpacks directory
+  const qlpacksPath = path.join(codeqlPath, "qlpacks");
+  if (!fs.existsSync(qlpacksPath)) {
+    baseMsg(
+      `Directory structure in ${codeqlPath}: ${fs.readdirSync(codeqlPath).join(", ")}`,
+    );
+    throw new Error(`QLPacks directory does not exist: ${qlpacksPath}`);
+  }
+
+  // Output contents of the qlpacks directory for debugging
+  baseMsg(
+    `QLPacks directory contents: ${fs.readdirSync(qlpacksPath).join(", ")}`,
+  );
+
+  // Check for codeql directory
+  const codeqlPackPath = path.join(qlpacksPath, "codeql");
+  if (!fs.existsSync(codeqlPath)) {
+    baseMsg(
+      `Directory structure in qlpacks: ${fs.readdirSync(qlpacksPath).join(", ")}`,
+    );
+    throw new Error(`CodeQL pack directory does not exist: ${codeqlPackPath}`);
+  }
+
+  // Output contents of the codeql pack directory for debugging
+  baseMsg(
+    `CodeQL pack directory contents: ${fs.readdirSync(codeqlPath).join(", ")}`,
+  );
+
+  // Check for language-queries directory
+  const qlpackDir = path.join(codeqlPackPath, `${language}-queries`);
+  if (!fs.existsSync(qlpackDir)) {
+    throw new Error(`Language queries directory does not exist: ${qlpackDir}`);
+  }
+
+  try {
+    // Get all directories in the language-queries folder
+    baseMsg(`Looking for version directories in: ${qlpackDir}`);
+    const dirs = fs
+      .readdirSync(qlpackDir, { withFileTypes: true })
+      .filter((dirent) => dirent.isDirectory())
+      .map((dirent) => dirent.name);
+
+    baseMsg(`Found version directories: ${dirs.join(", ")}`);
+
+    if (dirs.length === 0) {
+      throw new Error(`No version directories found in ${qlpackDir}`);
+    }
+
+    // Use the first directory found (there should typically be only one)
+    const versionDir = dirs[0];
+    const finalPath = path.join(qlpackDir, versionDir);
+
+    baseMsg(`Using version directory: ${versionDir}`);
+    baseMsg(`Final QLPack path: ${finalPath}`);
+
+    return finalPath;
+  } catch (error) {
+    throw new Error(
+      `Failed to find ${language}-queries version directory: ${util.getErrorMessage(error)}`,
+    );
+  }
+}
+
+async function generateConfigQueries(
+  codeqlPath: string,
+  dbPath: string,
+  logger: Logger,
+) {
+  const tempDir = path.join(dbPath, "temp");
+  if (!fs.existsSync(tempDir)) {
+    // log error and exit:
+    logger.error(
+      `Temporary directory ${tempDir} does not exist. Please ensure the database path is correct.`,
+    );
+    throw new Error(
+      `Temporary directory ${tempDir} does not exist. Please ensure the database path is correct.`,
+    );
+  }
+
+  // Use the extracted function to get the path
+  const qlpacksPath = findQLPackPath(codeqlPath, "java", logger);
+
+  const content = `---
+ -
+  query: ${path.join(qlpacksPath, "experimental/quantum/Analysis/UnknownKDFIterationCount.ql")}
+ -
+  query: ${path.join(qlpacksPath, "experimental/quantum/Analysis/InsecureNonceSource.ql")}
+ -
+  query: ${path.join(qlpacksPath, "experimental/quantum/Analysis/ReusedNonce.ql")}
+ -
+  query: ${path.join(qlpacksPath, "experimental/quantum/Analysis/KnownWeakKDFIterationCount.ql")}
+ -
+  query: ${path.join(qlpacksPath, "experimental/quantum/PrintCBOMGraph.ql")}
+`;
+
+  // Write the config-queries.qls file
+  const qlsPath = path.join(tempDir, "config-queries.qls");
+  // Output the existing contents (if any)
+  let existingContents = "";
+  if (fs.existsSync(qlsPath)) {
+    existingContents = fs.readFileSync(qlsPath, "utf8");
+    logger.warning(`Existing contents of ${qlsPath}:\n${existingContents}`);
+  } else {
+    logger.warning(`File ${qlsPath} does not exist yet.`);
+  }
+
+  fs.writeFileSync(qlsPath, content);
+
+  // Output the new contents
+  const newContents = fs.readFileSync(qlsPath, "utf8");
+  logger.warning(`New contents of ${qlsPath}:\n${newContents}`);
+
+  return qlsPath;
+}
+
+/**
+ * Converts a DGML (Directed Graph Markup Language) file to DOT format.
+ *
+ * DGML is Microsoft's XML-based format for representing directed graphs,
+ * commonly used in Visual Studio for dependency graphs and code maps.
+ * DOT is the graph description language used by Graphviz.
+ *
+ * @param dgmlFile - Path to the input DGML file
+ * @param dotFile - Path where the output DOT file will be written
+ * @returns Promise that resolves when conversion is complete
+ * @throws Error if file reading, XML parsing, or file writing fails
+ *
+ * @example
+ * ```typescript
+ * // Basic usage
+ * await convertDgmlToDot('dependency-graph.dgml', 'output.dot');
+ *
+ * // With error handling
+ * try {
+ *     await convertDgmlToDot('input.dgml', 'output.dot');
+ *     console.log('Conversion successful!');
+ * } catch (error) {
+ *     console.error('Conversion failed:', error);
+ * }
+ * ```
+ */
+export async function convertDgmlToDot(
+  dgmlFile: string,
+  dotFile: string,
+  logger: Logger,
+): Promise<void> {
+  const parser = new Parser({
+    explicitArray: true,
+    ignoreAttrs: false,
+    tagNameProcessors: [processors.stripPrefix],
+  });
+
+  try {
+    logger.info(`Processing DGML file: ${dgmlFile}`);
+
+    // Ensure input exists and is a file
+    let stat;
+    try {
+      stat = fs.statSync(dgmlFile);
+    } catch {
+      throw new Error(`DGML file not found: ${dgmlFile}`);
+    }
+    if (stat.isDirectory()) {
+      throw new Error(`Expected a file but got a directory: ${dgmlFile}`);
+    }
+
+    const xmlContent = fs.readFileSync(dgmlFile, "utf-8");
+    let parsed: any;
+    try {
+      parsed = await parser.parseStringPromise(xmlContent);
+    } catch (err: any) {
+      throw new Error(`Invalid DGML XML in ${dgmlFile}: ${err.message}`);
+    }
+
+    const root = parsed["DirectedGraph"];
+    if (!root) throw new Error("Missing <DirectedGraph> root element");
+    const nodesArr = root.Nodes;
+    if (!nodesArr || nodesArr.length === 0)
+      throw new Error("Missing <Nodes> section");
+    const linksArr = root.Links;
+    if (!linksArr || linksArr.length === 0)
+      throw new Error("Missing <Links> section");
+
+    const nodesSection = nodesArr[0].Node ?? [];
+    const linksSection = linksArr[0].Link ?? [];
+
+    const dotLines: string[] = [
+      "digraph cbom {",
+      "node [shape=box];",
+      "rankdir=LR;",
+    ];
+
+    // —— Nodes ——
+    for (const node of nodesSection) {
+      const raw = node["$"];
+      if (!raw) {
+        logger.info(`Skipping node with no attrs`);
+        continue;
+      }
+      const nodeId = typeof raw["Id"] === "string" ? raw["Id"] : undefined;
+      if (!nodeId) {
+        logger.info(`Skipping node without Id: ${JSON.stringify(raw)}`);
+        continue;
+      }
+
+      const parts: string[] = [];
+      for (const [k, v] of Object.entries(raw)) {
+        const val = typeof v === "string" ? v : String(v);
+        if (k === "Id") continue;
+        else if (k === "Label") parts.push(val);
+        else parts.push(`${k}=${val}`);
+      }
+
+      // join with literal \n; don't escape backslashes
+      let label = parts.join("\\n");
+      label = label.replace(/\//g, "\\/").replace(/"/g, '\\"');
+
+      dotLines.push(`nd_${nodeId} [label="${label}"];`);
+    }
+
+    // —— Edges ——
+    for (const edge of linksSection) {
+      const raw = edge["$"];
+      if (!raw) {
+        logger.info(`Skipping link with no attrs`);
+        continue;
+      }
+      const src = typeof raw["Source"] === "string" ? raw["Source"] : undefined;
+      const dst = typeof raw["Target"] === "string" ? raw["Target"] : undefined;
+      if (!src || !dst) {
+        logger.info(
+          `Skipping link without Source/Target: ${JSON.stringify(raw)}`,
+        );
+        continue;
+      }
+
+      const rl = typeof raw["Label"] === "string" ? raw["Label"] : "";
+      const edgeLabel = rl.replace(/\//g, "\\/").replace(/"/g, '\\"');
+
+      dotLines.push(`nd_${src} -> nd_${dst} [label="${edgeLabel}"];`);
+    }
+
+    dotLines.push("}");
+
+    // ensure output dir
+    fs.mkdirSync(path.dirname(dotFile), { recursive: true });
+    await fs.promises.writeFile(dotFile, dotLines.join("\n"), "utf-8");
+    logger.info(`DGML successfully converted to DOT: ${dotFile}`);
+  } catch (err: any) {
+    logger.error(`Error converting DGML to DOT: ${err.stack ?? err}`);
+    throw err;
+  }
+}
 // Runs queries and creates sarif files in the given folder
 export async function runQueries(
   sarifFolder: string,
@@ -599,6 +878,12 @@ export async function runQueries(
   for (const language of config.languages) {
     try {
       const sarifFile = path.join(sarifFolder, `${language}.sarif`);
+      const dgmlDir = path.join(sarifFolder, `${language}`);
+
+      // Create the directory for DGML outputs if it doesn't exist
+      if (!fs.existsSync(dgmlDir)) {
+        await fs.promises.mkdir(dgmlDir, { recursive: true });
+      }
 
       // The work needed to generate the query suites
       // is done in the CLI. We just need to make a single
@@ -607,6 +892,11 @@ export async function runQueries(
       logger.startGroup(`Running queries for ${language}`);
       const startTimeRunQueries = new Date().getTime();
       const databasePath = util.getCodeQLDatabasePath(config, language);
+      await generateConfigQueries(
+        path.parse(config.codeQLCmd).dir,
+        databasePath,
+        logger,
+      );
       await codeql.databaseRunQueries(databasePath, queryFlags);
       logger.debug(`Finished running queries for ${language}.`);
       // TODO should not be using `builtin` here. We should be using `all` instead.
@@ -622,11 +912,31 @@ export async function runQueries(
         sarifFile,
         config.debugMode,
       );
+      // Find the java-queries path using our reusable function
+      const javaQlpackPath = findQLPackPath(
+        path.parse(config.codeQLCmd).dir,
+        "java",
+        logger,
+      );
+      await codeql.databaseInterpretResultsCustom(
+        databasePath,
+        path.join(javaQlpackPath, "experimental/quantum/PrintCBOMGraph.ql"),
+        dgmlDir,
+        "dgml",
+        config.debugMode ? "-vv" : "-v",
+      );
+      const cbomDotFile = path.join(sarifFolder, "cbom.dot");
+      const cbomDgmlFile = path.join(
+        dgmlDir,
+        `${language}`,
+        "print-cbom-graph.dgml",
+      );
+      await convertDgmlToDot(cbomDgmlFile, cbomDotFile, logger);
+      logger.info(analysisSummary);
       const endTimeInterpretResults = new Date();
       statusReport[`interpret_results_${language}_duration_ms`] =
         endTimeInterpretResults.getTime() - startTimeInterpretResults.getTime();
       logger.endGroup();
-      logger.info(analysisSummary);
 
       if (await features.getValue(Feature.QaTelemetryEnabled)) {
         const perQueryAlertCounts = getPerQueryAlertCounts(sarifFile);
